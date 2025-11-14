@@ -63,6 +63,19 @@ public class BParticleSimMesh : MonoBehaviour
      * - the plane (BPlane)
      ***/
 
+    public Transform groundPlaneTransform;
+
+    public bool handlePlaneCollisions = true;
+
+    public float particleMass = 1.0f;
+
+    public bool useGravity = true;
+
+    public Vector3 gravity = new Vector3(0, -9.81f, 0);
+
+    private Mesh mesh;
+    private BParticle[] particles;
+    private BPlane plane;
 
 
     /// <summary>
@@ -81,10 +94,11 @@ public class BParticleSimMesh : MonoBehaviour
     /// </summary>
     void Start()
     {
-
+        // get mesh from the mesh filter
+        mesh = GetComponent<MeshFilter>().mesh;
+        InitParticles();
+        InitPlane();
     }
-
-
 
     /*** BIG HINT: My solution code has as least the following functions
      * InitParticles()
@@ -94,14 +108,205 @@ public class BParticleSimMesh : MonoBehaviour
      * ...
      ***/
 
+    void InitParticles()
+    {
+        Vector3[] vertices = mesh.vertices;
+        int vertexCount = vertices.Length;
+        particles = new BParticle[vertexCount];
 
+        // Create particles
+        for (int i = 0; i < vertexCount; i++)
+        {
+            particles[i].position = transform.TransformPoint(vertices[i]);
+            particles[i].velocity = Vector3.zero;
+            particles[i].mass = particleMass;
+            particles[i].attachedSprings = new List<BSpring>();
+            particles[i].attachedToContact = false;
+            particles[i].currentForces = Vector3.zero;
+        }
+
+        // Create springs (i < j avoids duplicates)
+        for (int i = 0; i < vertexCount; i++)
+        {
+            for (int j = i + 1; j < vertexCount; j++)
+            {
+                BSpring spring = new BSpring();
+                spring.ks = defaultSpringKS;
+                spring.kd = defaultSpringKD;
+                spring.restLength = Vector3.Distance(particles[i].position, particles[j].position);
+                spring.attachedParticle = j;
+
+                particles[i].attachedSprings.Add(spring);
+            }
+        }
+        // debug
+        // print("particles count: " + particles.Length);
+        // print("first particle springs count: " + particles[0].attachedSprings.Count);
+    }
+
+    void InitPlane()
+    {   
+        plane = new BPlane();
+        plane.position = groundPlaneTransform.position;
+        plane.normal = groundPlaneTransform.up.normalized; 
+    }
+
+    void UpdateMesh()
+    {
+        Vector3[] vertices = mesh.vertices;
+
+        for (int i = 0; i < particles.Length; i++)
+        {
+            vertices[i] = transform.InverseTransformPoint(particles[i].position);
+        }
+
+        mesh.vertices = vertices;
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+    }
+
+    void HandlePlaneCollisions()
+    {
+        for (int i = 0; i < particles.Length; i++)
+        {
+            BParticle p = particles[i];
+
+            // distance from particle to plane along plane normal
+            float dist = Vector3.Dot(p.position - plane.position, plane.normal);
+
+            // penetration detected if dist < 0 (some small epsilon for numerical stability)
+            if (dist < -1e-4f)
+            {
+                // if not already attached to the contact spring, initialize it
+                if (!p.attachedToContact)
+                {
+                    p.attachedToContact = true;
+
+                    // attach point to closest point on plane
+                    p.contactSpring.attachPoint = p.position - dist * plane.normal;
+                    p.contactSpring.ks = contactSpringKS;
+                    p.contactSpring.kd = contactSpringKD;
+                    p.contactSpring.restLength = 0.0f; // for contact spring, rest length is 0
+                }
+
+                // compute penalty spring force. formula copied from assignment desc.
+                Vector3 springForce = -p.contactSpring.ks * Vector3.Dot(p.position - p.contactSpring.attachPoint, plane.normal) * plane.normal;
+                Vector3 dampingForce = -p.contactSpring.kd * p.velocity;
+
+                p.currentForces += springForce + dampingForce;
+            }
+            else
+            {
+                // nmo longer in contact so detach
+                p.attachedToContact = false;
+            }
+
+            particles[i] = p;
+        }
+    }
+
+    void ComputeSpringForces()
+    {
+        for (int i = 0; i < particles.Length; i++)
+        {
+            BParticle p_i = particles[i];
+
+            // loop through all springs attached to particle i
+            foreach (BSpring spring in p_i.attachedSprings)
+            {
+                int j = spring.attachedParticle;
+                BParticle p_j = particles[j];
+
+                Vector3 xi = p_i.position;
+                Vector3 xj = p_j.position;
+
+                Vector3 vi = p_i.velocity;
+                Vector3 vj = p_j.velocity;
+
+                float ks = spring.ks;
+                float kd = spring.kd;
+                float rest = spring.restLength;
+
+                // direction vector
+                Vector3 dir = xi - xj;
+                float dist = dir.magnitude;
+
+                // avoid divide-by-zero
+                if (dist < 1e-6f)
+                    continue;
+
+                Vector3 d_hat = dir / dist;
+
+                // hooke law
+                float springExtension = rest - dist;
+                Vector3 Fs = ks * springExtension * d_hat;
+
+                // damping 
+                float relativeVel = Vector3.Dot(vi - vj, d_hat);
+                Vector3 Fd = kd * relativeVel * d_hat;
+
+                // final force on particle i
+                Vector3 F = Fs - Fd;
+
+                // apply to particle i
+                p_i.currentForces += F;
+
+                // apply equal and opposite to j
+                p_j.currentForces -= F;
+
+                // write back p_j
+                particles[j] = p_j;
+            }
+
+            // write back p_i after loop
+            particles[i] = p_i;
+        }
+    }
+
+    void ResetParticleForces()
+    {
+        for (int i = 0; i < particles.Length; i++)
+        {
+            particles[i].currentForces = Vector3.zero;
+        }
+    }
+
+    void ApplyGravity()
+    {
+        if (useGravity)
+        {
+            for (int i = 0; i < particles.Length; i++)
+            {
+                particles[i].currentForces += particles[i].mass * gravity;
+            }
+        }
+    }
+
+    void Integrate(float dt)
+    {
+        for (int i = 0; i < particles.Length; i++)
+        {
+            BParticle p = particles[i];
+
+            // acceleration = F / m
+            Vector3 acceleration = p.currentForces / p.mass;
+
+            // velocity update
+            p.velocity += acceleration * dt;
+
+            // position update
+            p.position += p.velocity * dt;
+
+            particles[i] = p;
+        }
+    }
 
     /// <summary>
     /// Draw a frame with some helper debug render code
     /// </summary>
     public void Update()
     {
-        /* This will work if you have a correctly made particles array
+        ///* This will work if you have a correctly made particles array
         if (debugRender)
         {
             int particleCount = particles.Length;
@@ -116,6 +321,19 @@ public class BParticleSimMesh : MonoBehaviour
                 }
             }
         }
-        */
+        //*/
+        float dt = Time.deltaTime;
+
+        ResetParticleForces();
+
+        ApplyGravity();
+
+        ComputeSpringForces();
+
+        if (handlePlaneCollisions) HandlePlaneCollisions();
+
+        Integrate(dt);
+
+        UpdateMesh();
     }
 }
